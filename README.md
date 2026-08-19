@@ -1,51 +1,73 @@
-# AI-Cup-TeamGazo-TNO
+# AI Cup 2026 — Bird-Group Classification
 
-TeamGazo's entry for the 2026 AI Cup on Kaggle, a bird classification challenge run with TNO.
+Radar tracks of things flying over the Wadden Sea, and the job is to work out which
+kind of bird made each one. There are 9 bird groups plus a "Clutter" bucket for
+non-bird returns. You submit a probability for each class and the leaderboard scores
+you on macro mean Average Precision (mAP), which weights every class equally so the
+rare birds matter as much as the common ones.
 
-The setup: you get radar tracks of things flying over the Wadden Sea and have to figure out which kind of bird made each one. There are 9 bird groups plus a "Clutter" bucket for non-bird returns. You submit a probability for each class and the leaderboard scores you on macro mean Average Precision (mAP), which weights every class equally so the rare birds matter as much as the common ones.
+Classes: `Clutter`, `Cormorants`, `Pigeons`, `Ducks`, `Geese`, `Gulls`,
+`Birds of Prey`, `Waders`, `Songbirds`.
 
-Heads up: this is the general model and methodology the team used, not necessarily the exact file behind the final submission. We couldn't pin down which version went in for the winning run, so `model_v4.py` is the representative pipeline.
+## Pipeline
 
-## Classes
+Three steps, run in order:
 
-Clutter, Cormorants, Pigeons, Ducks, Geese, Gulls, Birds of Prey, Waders, Songbirds.
+1. **`coordinate-into-csv.py`** — the `trajectory` column comes out of the Robin radar
+   as a WKB hex string (a LineString ZM in SRID 4326). This decodes it into a list of
+   `(lon, lat, altitude, RCS)` points. It writes straight back over `train.csv` and
+   `test.csv`, so run it once up front and keep a copy of the originals somewhere safe.
 
-## What's in here
+2. **`features.py`** — turns each decoded track into a fixed-length vector of numeric
+   features (see below). This is now the single home for all feature engineering.
 
-- `model_v4.py` — the whole pipeline: features, training, and writing out the submission.
-- `coordinate-into-csv.py` — a preprocessing step that decodes the raw `trajectory` column from hex into actual coordinates. It edits the CSVs in place.
-- `train.csv` — labelled tracks (~2,600 rows), with `bird_group` and `bird_species`.
-- `test.csv` — the tracks you have to predict (~1,870 rows).
-- `submission_v4.csv` — what `model_v4.py` spits out.
+3. **`model_v4.py`** — the model. It imports `add_features` from `features.py`, builds
+   the features on train and test, trains the ensemble, and writes the submission. It
+   no longer computes any features of its own.
 
-Both CSVs carry the radar fields: `track_id`, the two `timestamp_*_radar_utc` columns, `trajectory`, `trajectory_time`, `radar_bird_size`, `airspeed`, `min_z`, `max_z`. The training file also has the labels and the observation metadata (`observation_id`, `observer_position`, `observer_comment`, `n_birds_observed`, `bird_group`, `bird_species`).
+## `features.py`
 
-## How it works
+The public entry point is `add_features(df)`: hand it a DataFrame with decoded
+trajectories and it returns the same frame with all the feature columns attached. The
+full list of columns lives in `BROAD_COLS`. The features group into:
 
-### Decoding the trajectories
+- **Geometry** — bearing, duration, track length, sinuosity, net displacement, bounding-box aspect ratio.
+- **RCS (radar cross-section)** — a body-size proxy, summarised on both the dBsm scale (good for tree splits) and a linear m² scale (needed wherever a ratio has to be physical): mean/std/percentiles, trend, flicker, autocorrelation.
+- **Altitude** — mean/spread/percentiles, trend and how much it wanders off that trend, fractions flown low (<50 m) and high (>200 m).
+- **Vertical velocity** — climb/descent rates, time spent climbing vs. level, and how often the bird bobs up and down.
+- **Speed** — true 3D airspeed through space (not ground speed), its variation, trend, and acceleration.
+- **Turning / heading** — turn rates and cumulative turning, computed in metre-space so lat/lon distortion cancels out.
+- **Cross-domain** — combinations that mix motion and RCS (scintillation, a kinetic-energy proxy, agility, etc.).
+- **Bio-temporal** — where the track sits in the day/night cycle, using real sunrise/sunset at the radar site (Eemshaven): night flag, hours after sunset/sunrise, day length, twilight flag, and a nocturnal-migration-window flag.
 
-The `trajectory` column comes out of the Robin radar as a WKB hex string (a LineString ZM in SRID 4326). `coordinate-into-csv.py` reads the binary and turns each track into a list of `(Lon, Lat, Alt, M)` points. It writes straight back over `train.csv` and `test.csv`, so run it once up front and keep a copy of the originals somewhere safe.
+You can also run `features.py` on its own (`python features.py`) to compute the features
+once and cache them back into the CSVs, which saves recomputing them on every model run.
 
-### Features
+## `model_v4.py`
 
-Bird activity follows the clock and the tide, so most of the feature work is about encoding time properly. Raw hour and month are a trap because they jump at the boundaries (hour 23 sits right next to hour 0 in reality but they're miles apart as numbers), so time of day and season both get a sin/cos pair instead. There's also an `is_night` flag.
+A CatBoost multiclass classifier, tuned on the heavy-regularization side so it doesn't
+overfit the smallish training set. Rather than trust one model, it trains an ensemble:
+5 stratified CV folds times 5 random seeds, so 25 models, and averages their
+probabilities. Class imbalance is handled with softened inverse-frequency weights, with
+a few manual boosts on top for the classes that are hard or worth getting right
+(Cormorants, Birds of Prey, Waders, and so on).
 
-The interesting bit is the tides. Instead of pulling in real tide data, the M2 semi-diurnal cycle (~12.42 h) gets reconstructed straight from the timestamp as a sin/cos phase, plus a spring/neap envelope on the ~14.77-day cycle. That gives the model a sense of high vs low water for free.
+Feature selection is deliberately simple: everything is a feature except identifiers,
+labels, raw text, and the raw trajectory/timestamp columns. That means the model trains
+on the engineered `BROAD_COLS` plus a few leftover raw radar summaries (`airspeed`,
+`min_z`, `max_z`, and the categorical `radar_bird_size`, which CatBoost handles natively).
 
-A bunch of columns get thrown out on purpose. Anything that leaks observer-specific geometry (distances to the observer, lat/lon, bearing, approach angle) tends not to generalise, so those go. Same for the raw calendar fields once the cyclic versions exist, all the `weather_*` columns, and duplicate `_calc` copies of features that already exist.
-
-### The model
-
-It's CatBoost, multiclass, tuned on the heavy-regularization side so it doesn't overfit the smallish training set. Rather than trust one model, it trains an ensemble: 5 stratified CV folds times 5 random seeds, so 25 models, and averages their probabilities. Class imbalance is handled with softened inverse-frequency weights, with a few manual boosts on top for the classes that are hard or worth getting right (Cormorants, Birds of Prey, Waders, and so on).
-
-Scoring is done out-of-fold so the mAP number is honest. The run also prints a per-class AP breakdown and the top feature importances, which is handy for seeing where it's weak.
+Scoring is done out-of-fold so the mAP number is honest. The run also prints a per-class
+AP breakdown and the top feature importances, which is handy for seeing where it's weak,
+then writes `submission_v4.csv` with one probability column per class in the order Kaggle
+wants and `track_id` up front.
 
 ## Running it
 
 You'll need Python 3.9+ and:
 
 ```bash
-pip install pandas numpy scikit-learn catboost
+pip install pandas numpy scipy scikit-learn catboost astral pytz
 ```
 
 Then, in order:
@@ -58,8 +80,15 @@ python coordinate-into-csv.py
 python model_v4.py
 ```
 
-The first command decodes the trajectories in place (back up the CSVs first). The second trains the ensemble and writes `submission_v4.csv`, with one probability column per class in the order Kaggle wants and `track_id` up front. It logs the per-seed and final OOF mAP, the per-class table, and the top features as it goes.
+The first command decodes the trajectories in place (back up the CSVs first). The second
+builds the features via `features.py`, trains the 25-model ensemble, and writes
+`submission_v4.csv`. If you'd rather cache the features so repeated model runs don't
+recompute them, run `python features.py` once in between.
 
-## Team
+## Files
 
-TeamGazo, 2026 AI Cup, with TNO.
+- `coordinate-into-csv.py` — decodes the raw WKB-hex `trajectory` column into point tuples (edits CSVs in place).
+- `features.py` — all feature engineering; exposes `add_features(df)` and `BROAD_COLS`.
+- `model_v4.py` — the CatBoost ensemble; imports features from `features.py` and writes the submission.
+- `train.csv` / `test.csv` — the labelled and unlabelled radar tracks.
+- `submission_v4.csv` — the model's output.
