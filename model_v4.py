@@ -6,6 +6,10 @@ of 9 bird groups (or "Clutter") produced each track. Robustness comes from an
 ensemble: 5 cross-validation folds x 5 random seeds = 25 models whose predicted
 probabilities are averaged. Quality is measured with macro mean Average Precision
 (mAP), the competition metric, computed out-of-fold (OOF).
+
+Feature engineering lives entirely in features.py — this file imports
+`add_features` from there and never computes a feature itself. It only decides
+which of the resulting columns to feed the model, trains, and writes the submission.
 """
 
 import pandas as pd
@@ -15,6 +19,8 @@ from sklearn.preprocessing import LabelEncoder, label_binarize
 from sklearn.metrics import average_precision_score
 from catboost import CatBoostClassifier, Pool
 import warnings
+
+from features import add_features   # all feature engineering is defined here
 
 warnings.filterwarnings('ignore')
 
@@ -28,8 +34,9 @@ KAGGLE_COLUMN_ORDER = [
     'Gulls', 'Birds of Prey', 'Waders', 'Songbirds'
 ]
 
-# Columns that are identifiers, labels, or bookkeeping — never fed to the model as features.
-# (Includes the target `bird_group` and raw timestamps we only use to derive features.)
+# Columns that are identifiers, labels, raw inputs, or bookkeeping — never fed to
+# the model as features. Everything else (the engineered features from features.py
+# plus the raw radar summaries like airspeed/min_z/max_z/radar_bird_size) is used.
 META_COLS = {
     "track_id", "trajectory", "trajectory_time", "timestamp_start_radar_utc",
     "timestamp_end_radar_utc", "observation_id", "primary_observation_id",
@@ -38,80 +45,16 @@ META_COLS = {
     "original_track_id", "parent_idx",
 }
 
-# Real feature columns we deliberately exclude. Reasons: leakage/observer-specific
-# geometry (distances to observer, lat/lon, bearing, approach angle) that won't
-# generalize, and raw calendar fields superseded by the cyclic encodings below.
-DROP_FEATURES = {
-    "min_dist_to_observer", "mean_dist_to_observer", "max_dist_to_observer",
-    "rcs_distance_corrected", "observer_altitude", "approach_angle",
-    "start_lon", "start_lat", "end_lon", "end_lat",
-    "day_of_year", "season", "day_of_week", "time_of_day",
-    "bearing",
-}
-
-
-def add_temporal_tidal_features(df):
-    """Derive cyclic time-of-day/season and tidal-cycle features from the track timestamp.
-
-    Bird activity is strongly periodic (day/night, migration season, tides in the
-    Wadden Sea). Raw hour/month are bad model inputs because they're discontinuous
-    (hour 23 and hour 0 are adjacent in reality but far apart numerically), so each
-    cycle is encoded as a sin/cos pair that preserves that wrap-around.
-    """
-    # Use the radar start time if present, else a generic `timestamp`; skip if neither.
-    ts_col = next((c for c in ["timestamp_start_radar_utc", "timestamp"]
-                   if c in df.columns), None)
-    if ts_col is None:
-        return df
-
-    ts = pd.to_datetime(df[ts_col], utc=True, errors='coerce')
-
-    # Time of day as a fractional hour, encoded cyclically (period = 24h), plus a night flag.
-    hour = ts.dt.hour + ts.dt.minute / 60.0
-    df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
-    df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
-    df["is_night"] = ((hour < 6) | (hour > 20)).astype(int)
-
-    # Season, encoded cyclically (period = 12 months) so December and January stay adjacent.
-    month = ts.dt.month
-    df["month_sin"] = np.sin(2 * np.pi * month / 12)
-    df["month_cos"] = np.cos(2 * np.pi * month / 12)
-
-    # M2 semi-diurnal tide (~12.42h period): reconstruct the tidal phase analytically
-    # from the timestamp so the model can key on high/low water without real tide data.
-    M2_PERIOD_S = 12.42 * 3600
-    omega_M2 = 2 * np.pi / M2_PERIOD_S
-    unix_s = ts.astype(np.int64) / 1e9          # timestamp as seconds since Unix epoch
-    PHI = 1.4                                    # phase offset to align model tide with local tide
-    df["tidal_phase_sin"] = np.sin(omega_M2 * unix_s + PHI)
-    df["tidal_phase_cos"] = np.cos(omega_M2 * unix_s + PHI)
-    # Spring/neap envelope (~14.77-day cycle): amplitude of the tide, 0=neap, 1=spring.
-    df["spring_neap"] = np.abs(np.sin(2 * np.pi / (14.77 * 86400) * unix_s))
-
-    return df
-
 
 def get_features(df):
     """Return the list of column names to use as model inputs.
 
-    Drops meta/label columns, deliberately excluded features, and all `weather_*`
-    columns, then removes duplicate `_calc` variants of an already-present feature.
+    Drops meta/label/raw columns and any `weather_*` columns; whatever remains —
+    the engineered features attached by features.py, plus the leftover raw radar
+    summaries — is what the model trains on.
     """
-    # Everything we never train on: meta, hand-picked drops, and all weather columns.
-    all_drop = META_COLS | DROP_FEATURES
-    all_drop |= {c for c in df.columns if c.startswith('weather_')}
-    features = [c for c in df.columns if c not in all_drop]
-
-    # De-duplicate: if both `foo` and `foo_calc` exist, keep whichever is seen first
-    # (they carry the same signal, so feeding both is redundant).
-    seen_base, dedup_drop = set(), set()
-    for f in features:
-        base = f.replace("_calc", "")
-        if base in seen_base:
-            dedup_drop.add(f)
-        else:
-            seen_base.add(base)
-    return [f for f in features if f not in dedup_drop]
+    return [c for c in df.columns
+            if c not in META_COLS and not c.startswith('weather_')]
 
 
 def calculate_map(y_true, y_pred_probs, n_classes):
@@ -133,10 +76,10 @@ def main():
     train = pd.read_csv("train.csv")
     test = pd.read_csv("test.csv")
 
-    # Engineer the same time/tide features on both train and test.
-    print("\nAdding temporal/tidal features...")
-    train = add_temporal_tidal_features(train)
-    test = add_temporal_tidal_features(test)
+    # Build the exact same feature set on train and test, straight from features.py.
+    print("\nExtracting features (features.py)...")
+    train = add_features(train)
+    test = add_features(test)
 
     # Select the feature columns and slice train/test to exactly those.
     features = get_features(train)
@@ -166,7 +109,7 @@ def main():
     base_weights = (len(y) / (n_classes * class_counts)) ** 0.5
     # Extra manual boosts for classes that are hard/valuable to get right.
     for name, boost in [('Cormorants', 1.4), ('Birds of Prey', 1.2),
-                         ('Waders', 1.2), ('Ducks', 1.1), ('Geese', 1.1)]:
+                        ('Waders', 1.2), ('Ducks', 1.1), ('Geese', 1.1)]:
         idx = np.where(class_names == name)[0][0]
         base_weights[idx] *= boost
     cw = {i: float(w) for i, w in enumerate(base_weights)}
